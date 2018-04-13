@@ -1,0 +1,21 @@
+---
+title: "HQ Trivia 101"
+author: "Brandon Sherman"
+date: "4/1/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+HQ Trivia is a fun trivia app.  Each question has three possible
+answer choices, and a standard game has a grand prize of $2500 that is
+split among the winners.
+
+I'll be looking at HQ Trivia questions in two ways: As collections of
+text that cover a variety of topics, and as questions that are varying
+levels of difficulty based on the number of players who correctly
+answer them.

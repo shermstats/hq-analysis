@@ -1,0 +1,250 @@
+---
+title: "Preliminary Stuff"
+author: "Brandon Sherman"
+date: "4/1/2018"
+output: html_document
+---
+
+Before we can start looking at questions, we should do some prep work
+and some EDA.  Since I manually entered questions, answer lines, and
+numbers, the main issue will be incorrectly entered numbers.
+
+I'll also do the following:
+
+* Calculate summary statistics to ensure that all numbers are kosher.
+* Create a few auxillary data frames containing this data in a
+  different form.
+
+## Reading in the data
+
+We have the data in two frames: A games frame and a questions frame.
+I'm going to tidy these frames into frames at the question and at the
+answer level, along with making frames for winners.  In the process
+I'll remove columns we don't need for analysis.
+
+Note that we read data in using the `here::here` function, which is a
+suggestion that [Jenny Bryan wholeheartedly
+endorses](https://www.tidyverse.org/articles/2017/12/workflow-vs-script/).
+  
+```{r}
+library(dplyr)
+library(readr)
+library(janitor)
+library(lubridate)
+library(here)
+
+## Some questions have quotation marks, hence 'quote = ""'
+game_df <- read_tsv(here("data", "HQ Trivia Questions - Games.tsv"), quote = "") %>%
+    clean_names() %>%
+    select(-link) %>%
+    mutate(quiz_date = mdy(quiz_date))
+
+
+question_df <- read_tsv(here("data", "HQ Trivia Questions - Questions.tsv"), quote = "") %>%
+    clean_names() %>%
+    select(-theme_question)
+```
+
+Note that among the columns I removed in `question_df` is
+`theme_question`.  I originally thought there would be a lot of
+questions related to topics around the date of the quiz, like the
+Olympics or the Oscars.  This turned out to rarely be the case as I
+continued to collect data.
+
+
+## Sanity Checking
+
+Let's do some sanity checking.  There should be 12 of each ID most of
+the time, as most quizzes contain 12 questions.
+
+```{r}
+question_df %>%
+    select(quiz_id) %>% 
+    group_by(quiz_id) %>% 
+    count(sort = TRUE) %>%
+    tail(10)
+```
+
+Yay!  The lowest ID count is 12, indicating that the IDs were
+correctly entered.  Any weird question numbers?
+
+```{r}
+library(ggplot2)
+
+question_df %>%
+    select(question_number) %>%
+    ggplot(aes(x=question_number)) +
+    geom_histogram()
+```
+
+Good.  No negative numbers and very few numbers that are above 12,
+which correspond to special games.  Do answer lines correspond to the
+right questions?
+
+
+```{r}
+question_df %>%
+    select(question:answer_choice_c) %>%
+    print(width = Inf)
+```
+
+Questions and answers are properly aligned.
+
+Finally, let's check numbers of correct answers.  The number of people
+left to answer all questions in Question K should be less than or
+equal to the number of people who got the correct answer in Question
+(K - 1), since this is single elimination.  There will be some
+exceptions due to extra lives, but they should be negligible.
+
+As a preliminary step, we need to convert the question tibble into a
+correct answer tibble.  We need the number who answered the question
+correctly and the number who answered it incorrectly.
+
+```{r}
+library(tidyr)
+library(stringr)
+
+answer_col_to_letter <- function(x) toupper(str_sub(x, start = -1))
+
+correct_answer_choice_df <- question_df %>%
+    mutate(question_id = row_number()) %>%  ## Lets us identify individual questions
+    select(-(num_answered_a:num_answered_c), -notes) %>% 
+    gather(answer_letter, answer_text, answer_choice_a,
+           answer_choice_b, answer_choice_c) %>%
+    mutate(answer_letter = answer_col_to_letter(answer_letter)) %>%
+    filter(correct_answer == answer_letter) %>%
+    select(-correct_answer) %>%
+    arrange(question_id, question_number)
+
+answer_df <- question_df %>%
+    mutate(question_id = row_number()) %>%
+    select(-(question:answer_choice_c), -notes) %>% 
+    gather(num_answered_letter, num_answered, num_answered_a,
+           num_answered_b, num_answered_c) %>%
+    mutate(num_answered_letter = answer_col_to_letter(num_answered_letter))
+
+correct_answer_count_df <- answer_df %>%  ## Get correct answer counts...
+    filter(correct_answer == num_answered_letter) %>%
+    select(-num_answered_letter) %>% 
+    rename(num_answered_correct = num_answered)
+
+incorrect_answer_count_df <- answer_df %>%
+        filter(correct_answer != num_answered_letter) %>%
+        group_by(quiz_id, question_number) %>% 
+        summarize(num_answered_incorrect = sum(num_answered))
+
+answer_count_df <- correct_answer_count_df %>%
+    inner_join(incorrect_answer_count_df) %>%
+    inner_join(correct_answer_choice_df) %>%
+    select(-answer_letter) %>% ## Redundant
+    arrange(question_id, question_number)
+```
+
+Now we can check numbers of correct answers.  Again, since HQ is
+single elimination, we should see the number who move on to answer the
+next question (the total answerers for said question) be less than or
+equal to the number of people who correctly answered the current
+question.
+
+```{r}
+dropoff_df <- answer_count_df %>%
+    select(quiz_id:num_answered_incorrect, -correct_answer) %>%
+    group_by(quiz_id) %>% ## We're only calculating these values within a quiz
+    mutate(num_answered_overall = num_answered_correct + num_answered_incorrect) %>%
+    select(-num_answered_incorrect) %>% 
+    mutate(answer_diff = num_answered_correct - lead(num_answered_overall)) %>%
+    ungroup()
+
+dropoff_df %>%
+    filter(answer_diff <= 0) %>%    
+    glimpse
+```
+
+This is surprising!  346 questions out of the total 690, a full 50.1%,
+do not meet this criteria.  After manually checking a few examples by
+going back to the original game, ("Botanically speaking, what type of
+fruit is an avocado?", "By definition, an ambulatory person is what?",
+"Which of these is NOT a palindrome?", and "Which of these does NOT
+appear on Mexico's coat of arms?"), these are correct.  I guess a lot
+of people use extra lives when playing HQ!
+
+These dropoff numbers mean that extra lives - which I originally
+assumed were negligible - are actually a large factor in determining
+dropoff.  This will make certain kinds of analysis, like trajectory
+analysis of number of users during a quiz, considerably more difficult
+because we don't know how many users use extra lives in each question.
+
+## Exporting Some Helper Frames
+
+We're going to need some of the data frames we previously created.
+Let's make a correct answer choice data frame and save it as a
+`.feather` object so we can easily access it in the future.  In the
+process, we'll also add a `prop_answered_correct` column that contains 
+the proportion of people who answered the question correctly.
+
+```{r}
+library(feather)
+
+correct_answer_df <- correct_answer_count_df %>%
+    inner_join(incorrect_answer_count_df) %>% 
+    inner_join(correct_answer_choice_df) %>%
+    select(question_id, quiz_id, question_number, question, answer_text, correct_answer, num_answered_correct, num_answered_incorrect) %>%
+    mutate(prop_answered_correct = num_answered_correct / (num_answered_correct + num_answered_incorrect)) %>% 
+    arrange(question_id)
+
+correct_answer_df %>%
+    write_feather(here("temp", "correct_answer_df.feather"))
+```
+
+
+## Other Questions
+
+When we eventually cluster questions based on difficulty, we'll want
+to know what the hardest questions are.  We'll define the hardest
+questions as the questions with the lowest proportion of correct
+answer, regardless of question number.
+
+```{r}
+correct_answer_df %>%
+    top_n(15, -prop_answered_correct) %>%
+    ggplot(aes(reorder(question, -prop_answered_correct), prop_answered_correct)) +
+    geom_col(aes(fill = question_number)) +
+    geom_text(aes(label = answer_text), color = "white", nudge_y = -0.04) +
+    labs(x = NULL, y = "% Answered Correctly") +
+    ggtitle("Hardest HQ Trivia Questions") +
+    scale_y_continuous(breaks = seq(0., 0.20, by = 0.05)) +
+    coord_flip()
+```
+
+
+```{r}
+question_df %>%
+    filter(grepl("fraternity", question, ignore.case = TRUE)) %>%
+    select(question, question_number, starts_with("answer_choice"))
+
+question_df %>%
+    filter(grepl("hotmail", question, ignore.case = TRUE)) %>%
+    glimpse
+```
+
+When we look at the 15 most difficult HQ Trivia questions, we notice the following:
+
+* Some of these are trick questions.  The infamous "Birds' nest soup"
+  and "Renminbi" questions are on here.  The question about a
+  "historic fire" and another on the first African American fraternity
+  have answer choices that seem correct but are not.  The "historic
+  fire" question has "Chicago" as an answer choice, which seems
+  intuitive because Chicago had an infamous fire in 1871.  The African
+  American fraternity question has Howard as an answer, which is a
+  historically black college.
+  
+  The first trick question appears relatively early, which is one
+  reason why it's so infamous.  The second two appear later in the
+  game, which is when questions should be harder.
+  
+* Some of these questions are legitimately difficult.  I would expect
+  very few people to know which chain Ross Perot helped establish, and
+  about as few to know what a catenary is.  (For reference, it's
+  [...the curve that an idealized hanging chain or cable assumes under
+  its own weight when supported only at its
+  ends.](https://en.wikipedia.org/wiki/Catenary)).  
