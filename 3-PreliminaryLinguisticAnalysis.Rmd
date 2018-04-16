@@ -1,0 +1,254 @@
+---
+title: "Preliminary Stuff"
+author: "Brandon Sherman"
+date: "4/15/2018"
+output: html_document
+---
+
+## Intro
+
+In this document, we continue to do exploratory analysis.  We'll look
+at token distributions, calculate some preliminary statistics, and do
+some very basic sentiment analysis.  The work here will be used when
+clustering questions based on content.
+
+
+```{r}
+library(feather)
+library(here)
+
+correct_answer_df <- read_feather(here("temp", "correct_answer_df.feather"))
+```
+
+
+## Tokenization
+
+We'll make three data frames of questions: One with unigrams, one with
+bigrams, and one with trigrams.  We'll look at IDF and TF-IDF of each.
+The reason for looking at both is that although tf-idf is useful, IDF
+may be equally useful because questions are short strings of text.
+This implies that it is unlikely for a given word to appear multiple
+times in the same question, implying that TF for most words will be 1.
+Luckily the `bind_tf_idf` function gives us both IDF and TF-IDF.  Here
+is what I expect to find:
+
+
+* After removing stopwords, I'd expect the unigrams to consist largely
+  of proper nouns or the topic that the question is asking about.
+  
+* I'd expect bigrams to include "...is NOT" and some common proper noun phrases, like "United States."
+
+* I'd expect trigrams to contain phrases of question, like "Which of these" or "What U.S. state".
+
+Let's take a look.  We'll use the `tidytext` package to do this processing.
+
+
+### Helper Functions
+
+First, a nice helper function.  One of the key philosophies behind
+programming is "don't repeat yourself", so I'll write some nice
+convenience functions.  Right now the only helper function we need
+takes a vector of stopwords and converts it to a one-column tibble
+with column name "stop_word".
+
+
+```{r}
+stop_words_to_tibble <- function(stop_words) {
+    ## Given a vector of stop words, convert it to a one-column tibble with
+    ## a column called "stop_word"
+
+    stop_words %>%
+        as_tibble() %>%
+        setNames("stop_word")
+}
+```
+
+### Unigrams
+
+Now we'll split our questions into unigrams, saving bigrams and
+trigrams for later, as we'll have to do additional processing.  Note
+that because so many of these words appear only once in a question, we
+should remove stopwords to avoid a lot of "This topic is about "the"".
+
+```{r}
+library(dplyr)
+library(tidytext)
+library(stopwords)
+
+
+stop_words_unigram <- stopwords() %>% ## Keep "not" because it's an important prefix
+    stop_words_to_tibble()
+
+
+## Get minimal info we need, keeping answers for context.
+question_df <- correct_answer_df %>%
+    rename(answer = answer_text) %>%  ## Easier to type
+    select(question_id, question, answer)
+
+question_unigrams <- question_df %>%
+    unnest_tokens(token, question, token = "words") %>% 
+    anti_join(stop_words_unigram, by = c("token" = "stop_word"))
+```
+
+Great, we have unigrams!  Let's calculate tf-idf on them, treating
+each question as a document:
+
+
+```{r}
+question_words <- question_unigrams %>%
+    group_by(question_id) %>% 
+    count(question_id, token, sort = TRUE) %>%
+    ungroup()
+
+total_words <- question_words %>%
+    group_by(question_id) %>%
+    summarize(total = sum(n))
+
+question_words <- left_join(question_words, total_words, by = "question_id") %>%
+    bind_tf_idf(token, question_id, n) %>%
+    select(-total) %>% 
+    inner_join(question_df, by = "question_id") ## Get the questions back
+```
+
+
+Now what unigrams define their questions?  Let's pick a random sample
+of 6 questions (6 looks better than 5 when visualized), then look at
+the Top 3 words in terms of tf-idf for each.  3 is an arbitrarily
+selected number that seems small enough to define a question, which is
+a short string of text.
+
+```{r}
+set.seed(42)
+selected_question_ids <- question_df %>%
+    s
+elect(question_id) %>% 
+    sample_n(6)
+```
+
+First, let's look compare results from tf_idf and idf.  How often are
+the ranks for the top three words the same?
+
+
+```{r}
+question_words %>%
+    group_by(question_id) %>%
+    mutate(idf_rank = dense_rank(desc(idf)),
+           tf_idf_rank = dense_rank(desc(tf_idf))) %>%
+    ungroup() %>% 
+    filter(idf_rank <= 3 & tf_idf_rank <= 3) %>% 
+    summarize(num_terms = n(),
+              num_rank_equal = sum(idf_rank == tf_idf_rank)) %>%
+    mutate(pct_rank_equal = num_rank_equal / num_terms)
+```
+
+97.7% of the time, IDF and TF-IDF pick the same most important words.
+We'll arbitrarily pick which of the two metrics to use based on
+computational complexity and whether or not an algorithm wants a
+tf-idf matrix, defaulting to IDF because it's simpler.
+
+Based on IDF, what are the three words that are most important to each
+question?  Note that due to ties in IDF, many of these will have more
+than 3 words listed.
+
+```{r}
+library(ggplot2)
+
+selected_question_df <- question_df %>%
+    inner_join(selected_question_ids, by = "question_id") %>% 
+    select(-answer) %>%
+    as.data.frame
+
+question_words %>%
+    inner_join(selected_question_df) %>%
+    arrange(-idf) %>% 
+    mutate(token = factor(token, levels = rev(unique(token)))) %>%
+    group_by(token) %>%
+    top_n(3, idf) %>%
+    ungroup() %>% 
+    ggplot(aes(token, idf, fill = question)) +
+    geom_col(show.legend = FALSE) +
+    labs(x = NULL, y = "idf") +
+    facet_wrap(~question, ncol = 2, scales = "free", labeller = labeller(question = label_wrap_gen(width = 50))) +
+    coord_flip()
+```
+
+Note that some of these print more than 3 top words if there are
+additional words with the highest IDF.  Does IDF accurately
+characterize the questions?
+
+* The first question marks "hills", "horror", and "title" as the most
+  important words.  "horror" and "title" are important, but splitting
+  into unigrams hides that "The Hills Have" is a phrase.
+  
+* The second question marks "commercially", "sparkling", and "water"
+  as the most important words.  The question is about sparkling water,
+  but we're interested in which brand was commercially introduced
+  first.  "Introduced" should probably be a more important word since
+  it's asking when the water was *introduced*, but IDF still did a
+  good job.  Additionally, the word "which" is important because it
+  limits the correct answer to one of the answer choices.  If we had a
+  question that asked "Which of these presidents came first?" and the
+  answer choices were "John Quincy Adams", "Bill Clinton", and
+  "Benjamin Harrison", the answer is "John Quincy Adams", because he
+  is the first president *in the answer choices.* Without the phrase
+  "which of these", the answer would be "George Washington" because he
+  was the first president in history.
+  
+* The third question marks the words "spinoff", "show", and "TV".  It
+  is asking about a show that's a spinoff of a spinoff, but our basic
+  unigrams are too simple to identify that it's asking about "a
+  spinoff of a spinoff."  Plus it does not contain the word "which",
+  which even if we had included it, would have been marked less
+  relevant because it's in many documents.  This is interesting
+  because "which" is the key word identifying that the answer is not
+  something you can ask without an answer choice like "Who was the
+  first president of the United States?".  Rather, the must be
+  included in one of the choices.
+  
+* The fourth question is "The bar exam is generally taken after you
+  graduate from what?"  The words "exam", "generally", and "graduate"
+  are marked as the most important words.  This is clearly misleading
+  because "bar" is marked as less important, as it appears in many
+  documents.  However because "bar" has many possible uses, like
+  "chocolate bar" and "raising the bar", it makes sense that we miss
+  that "bar" is important in our unigram model.
+  
+* The fifth question marks the words "future", "serve", and "schools"
+  as most important.  As is the case with the TV show question, the
+  word "which" is very important because the only valid answer is one
+  of the listed choices, even if an alternative answer exists outside
+  of them.  The word "president" is missed, likely because there are
+  many questions that ask about presidents.  I suspect that if we
+  split the question into bigrams, it would identify the phrase
+  "U.S. president" as important.  That is, unless the phrase
+  "U.S. president" also appears in many questions...
+  
+* The sixth and final question marks "j", "dress", "grammys", and
+  "lo's" as important tokens.  It's interesting to note that our
+  tokenization algorithm split "J-Lo" into two words, but it does
+  identify them both as important.  It also didn't identify "lo" and
+  "lo's" as the same token.  The question is clearly about Jennifer
+  Lopez's dress at the Grammys, so IDF definitely identified the right
+  most important tokens.  Such a powerful, basic metric!
+
+
+So what have we learned by looking at unigrams?
+
+* Good named entity recognition is useful.  Looking at unigrams by IDF
+  makes it clear that some important unigrams are common, and they
+  would be picked up if we performed some kind of "unigram if not
+  named entity, otherwise named entity" tokenization.
+  
+* Phrases are important.  Bigrams like "sparkling water" and "bar
+  exam" are important, regardless of how important the individual
+  words are.
+  
+* Question words, despite being stop words, are incredibly important
+  for characterizing what kind of answer is expected.  Basic
+  tokenization and stripping of stop words will not allow us to
+  characterize question structure, although it is still useful for
+  identifying the topic of a question (e.g. sports, movies).
+  
+### Named Entity Tokenization
+
+### Bigrams and Trigrams
